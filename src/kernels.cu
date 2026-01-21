@@ -17,11 +17,46 @@
  * @param cols Number of columns in the matrix.
  * @return The trace (sum of diagonal values) of the matrix.
  */
+
+ template <typename T>
+ __global__ void traceKernel(const T* d_input, size_t rows, size_t cols, T* d_result){
+   int idx = blockIdx.x * blockDim.x + threadIdx.x;
+   if(idx < rows * cols){
+     int row_idx = idx /cols;
+     int col_idx = idx % cols;
+     if(row_idx == col_idx){
+       atomicAdd(d_result, d_input[idx]);
+     }
+   }
+ }
+
 template <typename T>
 T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
   // TODO: Implement the trace function
-  return T(-1);
+  //先把h_input拷贝到GPU
+  T* d_input;
+  T* d_result;
+  RUNTIME_CHECK(cudaMalloc(&d_input, rows * cols * sizeof(T)));
+  RUNTIME_CHECK(cudaMemcpy(d_input, h_input.data(), rows * cols * sizeof(T), cudaMemcpyHostToDevice));
+  RUNTIME_CHECK(cudaMalloc(&d_result, sizeof(T)));
+  RUNTIME_CHECK(cudaMemset(d_result, 0, sizeof(T)));
+  //设置stream
+  cudaStream_t stream;
+  RUNTIME_CHECK(cudaStreamCreate(&stream));
+  dim3 block(256);
+  dim3 grid((rows * cols + 256 - 1) / 256);
+  traceKernel<T><<<grid, block, 0, stream>>>(d_input, rows, cols, d_result);
+  RUNTIME_CHECK(cudaStreamSynchronize(stream));
+  T h_result;
+  RUNTIME_CHECK(cudaMemcpy(&h_result, d_result, sizeof(T), cudaMemcpyDeviceToHost));
+  RUNTIME_CHECK(cudaFree(d_input));
+  RUNTIME_CHECK(cudaFree(d_result));
+  RUNTIME_CHECK(cudaStreamDestroy(stream));
+  return h_result;
+
 }
+
+
 
 /**
  * @brief Computes flash attention for given query, key, and value tensors.
