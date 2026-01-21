@@ -1,6 +1,5 @@
 #include <vector>
 #include <cuda_fp16.h>
-
 #include "../tester/utils.h"
 
 /**
@@ -18,16 +17,25 @@
  * @return The trace (sum of diagonal values) of the matrix.
  */
 
+//  template <typename T>
+//  __global__ void traceKernel(const T* d_input, size_t rows, size_t cols, T* d_result){
+//    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+//    if(idx < rows * cols){
+//      int row_idx = idx /cols;
+//      int col_idx = idx % cols;
+//      if(row_idx == col_idx){
+//        atomicAdd(d_result, d_input[idx]);
+//      }
+//    }
+//  }
+
  template <typename T>
- __global__ void traceKernel(const T* d_input, size_t rows, size_t cols, T* d_result){
-   int idx = blockIdx.x * blockDim.x + threadIdx.x;
-   if(idx < rows * cols){
-     int row_idx = idx /cols;
-     int col_idx = idx % cols;
-     if(row_idx == col_idx){
-       atomicAdd(d_result, d_input[idx]);
-     }
-   }
+ __global__ void traceKernel(T* d_result, const T* d_input, size_t rows, size_t cols){
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int n = min(rows,cols);
+  if(idx < n){
+    atomicAdd(d_result, d_input[idx * cols + idx]);
+  }
  }
 
 template <typename T>
@@ -44,8 +52,8 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
   cudaStream_t stream;
   RUNTIME_CHECK(cudaStreamCreate(&stream));
   dim3 block(256);
-  dim3 grid((rows * cols + 256 - 1) / 256);
-  traceKernel<T><<<grid, block, 0, stream>>>(d_input, rows, cols, d_result);
+  dim3 grid( (std::min(rows,cols) + 256 - 1) / 256);
+  traceKernel<T><<<grid, block, 0, stream>>>(d_result, d_input, rows, cols);
   RUNTIME_CHECK(cudaStreamSynchronize(stream));
   T h_result;
   RUNTIME_CHECK(cudaMemcpy(&h_result, d_result, sizeof(T), cudaMemcpyDeviceToHost));
