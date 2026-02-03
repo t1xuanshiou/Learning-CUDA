@@ -236,10 +236,10 @@ __global__ void flashAttentionKernel(T* d_q, T* d_k, T* d_v, T* d_o,
         int min_kv_col = j;
         
         if (max_q_row >= min_kv_col) {
-          // if (global_row < global_col) {
-          //   s_ij = -INFINITY;
-          // }
-          s_ij = -INFINITY;
+          if (global_row < global_col) {
+            s_ij = -INFINITY;
+          }
+          // s_ij = -INFINITY;
         }
         
       }
