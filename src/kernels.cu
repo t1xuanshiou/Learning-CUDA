@@ -4,7 +4,6 @@
 
 #define BLOCK_SIZE 32
 
-// 辅助函数：为不同类型提供 max 和 exp
 template <typename T>
 inline __device__ T typed_max(T a, T b) {
   return max(a, b);
@@ -15,7 +14,6 @@ inline __device__ T typed_exp(T x) {
   return exp(x);
 }
 
-// half 类型的特化
 template <>
 inline __half __device__ typed_max<__half>(__half a, __half b) {
   return __hgt(a, b) ? a : b;
@@ -63,7 +61,6 @@ __global__ void traceKernel(T* d_result, const T* d_input, size_t rows, size_t c
 
         T val = d_input[idx * cols + idx];
         
-        // 执行 Warp 内规约
         T warp_sum = warp_reduce(val);
 
         if(tid % 32 == 0){
@@ -75,10 +72,8 @@ __global__ void traceKernel(T* d_result, const T* d_input, size_t rows, size_t c
 
     if(tid < 32){
         int num_warps = blockDim.x / 32; 
-        // 只有前 num_warps 个线程读取有效值，其余补 0
         T block_sum = (tid < num_warps) ? smem[tid] : (T)0;
         
-        // 再次 Warp 规约得到 Block 总和
         block_sum = warp_reduce(block_sum);
         
         if(tid == 0){
@@ -145,31 +140,24 @@ template <typename T>
 __global__ void flashAttentionKernel(T* d_q, T* d_k, T* d_v, T* d_o, 
                                      int batch_size, int target_seq_len, int src_seq_len, 
                                      int query_heads, int kv_heads, int head_dim, 
-                                     bool is_causal, int ratio, float attention_scale) { // 注意：scale 改为 float 传入
+                                     bool is_causal, int ratio, float attention_scale) { 
 
   int current_batch = blockIdx.x;
   int current_q_head = blockIdx.y;
   int current_kv_head = current_q_head / ratio;
 
-  // -----------------------------------------------------------
-  // [关键修改 1] Shared Memory 布局重构：统计量和累加器使用 float
-  // -----------------------------------------------------------
   extern __shared__ char smem_raw[];
   
-  // Q, K, V, S 保持为 T (节省显存，且对精度影响相对较小)
   T* smem_q = reinterpret_cast<T*>(smem_raw);
   T* smem_k = smem_q + BLOCK_SIZE * head_dim;
   T* smem_v = smem_k + BLOCK_SIZE * head_dim;
   
-  // 计算当前偏移量 (以字节为单位)
   char* curr_ptr = (char*)(smem_v + BLOCK_SIZE * head_dim);
   
-  // M, L, O 必须使用 float (FP32) 以保持累加精度
   float* smem_s = reinterpret_cast<float*>(curr_ptr); 
   float* smem_m = smem_s + BLOCK_SIZE * BLOCK_SIZE;
   float* smem_l = smem_m + BLOCK_SIZE;
   float* smem_o = smem_l + BLOCK_SIZE;
-  // -----------------------------------------------------------
 
   int base_q_offset = current_batch * target_seq_len * query_heads * head_dim + current_q_head * head_dim;
   int base_kv_offset = current_batch * src_seq_len * kv_heads * head_dim + current_kv_head * head_dim;
@@ -186,21 +174,38 @@ __global__ void flashAttentionKernel(T* d_q, T* d_k, T* d_v, T* d_o,
       }
     }
 
-    // 初始化统计量 (float)
     if(threadIdx.x == 0){
-      smem_m[threadIdx.y] = -INFINITY; // float infinity
-      smem_l[threadIdx.y] = 0.0f;      // float zero
+      smem_m[threadIdx.y] = -INFINITY;
+      smem_l[threadIdx.y] = 0.0f;
     }
-    // 初始化 accumulator O (float)
     for(int k = 0; k < head_dim; k += BLOCK_SIZE){
       if (threadIdx.x + k < head_dim)
           smem_o[threadIdx.y * head_dim + threadIdx.x + k] = 0.0f;
     }
     __syncthreads();
 
-    for(int j = 0; j < src_seq_len; j += BLOCK_SIZE){
+    int j_start = 0;
+    int j_end = src_seq_len;
+    
+    if (is_causal) {
+      int max_valid_col = i + BLOCK_SIZE - 1;
       
-      // Load K, V
+      j_end = ((max_valid_col / BLOCK_SIZE) + 1) * BLOCK_SIZE;
+      j_end = min(j_end, src_seq_len);
+    }
+
+    for(int j = j_start; j < j_end; j += BLOCK_SIZE){
+      
+      if (is_causal) {
+
+        int min_q_row = i;
+        int min_kv_col = j;
+        
+        if (min_q_row < min_kv_col) {
+          continue;
+        }
+      }
+      
       bool is_valid_kv_row = (j + threadIdx.y < src_seq_len);
       for(int k = 0; k < head_dim && k + threadIdx.x < head_dim; k += BLOCK_SIZE){
         int cur_kv_idx = base_kv_offset + (j + threadIdx.y) * kv_heads * head_dim + k + threadIdx.x;
@@ -223,10 +228,22 @@ __global__ void flashAttentionKernel(T* d_q, T* d_k, T* d_v, T* d_o,
       // Masking
       int global_row = i + threadIdx.y;
       int global_col = j + threadIdx.x;
+      
       if (global_col >= src_seq_len) s_ij = -INFINITY;
-      if(is_causal && global_row < global_col) s_ij = -INFINITY;
+      
+      if (is_causal) {
+        int max_q_row = i + BLOCK_SIZE - 1;
+        int min_kv_col = j;
+        
+        if (max_q_row >= min_kv_col) {
+          // This block may have some valid elements
+          if (global_row < global_col) {
+            s_ij = -INFINITY;
+          }
+        }
+        
+      }
 
-      // Update stats (全部使用 float)
       float row_max = s_ij;
       for(int offset = BLOCK_SIZE / 2; offset > 0; offset >>= 1){
         row_max = fmaxf(row_max, __shfl_down_sync(0xffffffff, row_max, offset));
@@ -236,8 +253,7 @@ __global__ void flashAttentionKernel(T* d_q, T* d_k, T* d_v, T* d_o,
       float m_old = smem_m[threadIdx.y];
       float m_new = fmaxf(m_old, row_max);
 
-      if (row_max == -INFINITY) s_ij = 0.0f;
-      else s_ij = expf(s_ij - m_new);
+      s_ij = expf(s_ij - m_new);
 
       float row_sum = s_ij;
       for(int offset = BLOCK_SIZE / 2; offset > 0; offset >>= 1){
@@ -246,7 +262,7 @@ __global__ void flashAttentionKernel(T* d_q, T* d_k, T* d_v, T* d_o,
       row_sum = __shfl_sync(0xffffffff, row_sum, 0);
 
       float l_old = smem_l[threadIdx.y];
-      float rescale_factor = (m_old == -INFINITY) ? 0.0f : expf(m_old - m_new);
+      float rescale_factor = expf(m_old - m_new);
       float l_new = row_sum + rescale_factor * l_old;
 
       smem_s[threadIdx.y * BLOCK_SIZE + threadIdx.x] = s_ij; 
@@ -261,7 +277,7 @@ __global__ void flashAttentionKernel(T* d_q, T* d_k, T* d_v, T* d_o,
         float o_ij = smem_o[threadIdx.y * head_dim + k + threadIdx.x] * rescale_factor;
         
         for(int l = 0; l < BLOCK_SIZE; l++){
-          o_ij += smem_s[threadIdx.y * BLOCK_SIZE + l] * (float)smem_v[l * head_dim + k + threadIdx.x];
+          o_ij += smem_s[threadIdx.y * BLOCK_SIZE + l] * float(smem_v[l * head_dim + k + threadIdx.x]);
         }
         smem_o[threadIdx.y * head_dim + k + threadIdx.x] = o_ij;
       }
@@ -311,18 +327,11 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
   dim3 grid(batch_size, query_heads);
   
   int ratio = query_heads / kv_heads; 
-  float attention_scale = 1.0f / sqrt((float)head_dim); // Host 端也用 float
+  float attention_scale = 1.0f / sqrt((float)head_dim);
   
- 
   size_t smem_bytes_t = (3 * BLOCK_SIZE * head_dim) * sizeof(T);
-  
-  // S, M, L, O 是 float 类型
-  // S 大小: BLOCK_SIZE * BLOCK_SIZE
-  // M, L 大小: BLOCK_SIZE
-  // O 大小: BLOCK_SIZE * head_dim
   size_t smem_bytes_float = (BLOCK_SIZE * BLOCK_SIZE + 2 * BLOCK_SIZE + BLOCK_SIZE * head_dim) * sizeof(float);
   size_t smem_size = smem_bytes_t + smem_bytes_float;
-  // -----------------------------------------------------------
   
   cudaStream_t stream;
   RUNTIME_CHECK(cudaStreamCreate(&stream));
