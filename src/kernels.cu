@@ -40,99 +40,74 @@ inline __half __device__ typed_exp<__half>(__half x) {
  */
 
  template <typename T>
- __device__ T warp_reduce(T val){
-  #pragma unroll
-  for(int offset = 16; offset > 0; offset >>= 1){
-    val += __shfl_down_sync(0xffffffff, val, offset);
-  }
-  return val;
- }
+__device__ T warp_reduce(T val) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+    return val;
+}
 
-// warp内规约优化
 template <typename T>
-__global__ void traceKernel(T* d_result, const T* d_input, size_t rows, size_t cols){
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int tid = threadIdx.x;
-    int n = min(rows, cols);
+__global__ void traceKernel(T* d_result, const T* d_input, size_t rows, size_t cols, size_t n) {
     extern __shared__ char smem_raw[];
     T* smem = reinterpret_cast<T*>(smem_raw);
-
-    if(idx < n){
-
-        T val = d_input[idx * cols + idx];
-        
-        T warp_sum = warp_reduce(val);
-
-        if(tid % 32 == 0){
-            smem[tid / 32] = warp_sum;
-        }
-    
-
+    int tid = threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + tid;
+    T val = (idx < n) ? d_input[idx * cols + idx] : (T)0;
+    T warp_sum = warp_reduce(val);
+    if (tid % 32 == 0) {
+        smem[tid / 32] = warp_sum;
+    }
     __syncthreads();
 
-    if(tid < 32){
-        int num_warps = blockDim.x / 32; 
+    if (tid < 32) {
+        int num_warps = (blockDim.x + 31) / 32;
         T block_sum = (tid < num_warps) ? smem[tid] : (T)0;
-        
         block_sum = warp_reduce(block_sum);
-        
-        if(tid == 0){
+        if (tid == 0) {
             atomicAdd(d_result, block_sum);
         }
     }
-  }
 }
 
 template <typename T>
 T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
-  // 创建流（用于异步操作）
-  cudaStream_t stream;
-  RUNTIME_CHECK(cudaStreamCreate(&stream));
-  
-  // 异步内存分配
-  T* d_input;
-  T* d_result;
-  RUNTIME_CHECK(cudaMallocAsync(&d_input, rows * cols * sizeof(T), stream));
-  RUNTIME_CHECK(cudaMallocAsync(&d_result, sizeof(T), stream));
-  
-  // 异步内存拷贝和初始化
-  RUNTIME_CHECK(cudaMemcpyAsync(d_input, h_input.data(), rows * cols * sizeof(T), cudaMemcpyHostToDevice, stream));
-  RUNTIME_CHECK(cudaMemsetAsync(d_result, 0, sizeof(T), stream));
-  
-  // 同步流：确保数据拷贝完成后再启动 kernel
-  RUNTIME_CHECK(cudaStreamSynchronize(stream));
-  
-  // 配置并启动 kernel
-  dim3 block(256);
-  dim3 grid((std::min(rows, cols) + 256 - 1) / 256);
-  
-  // 分配 shared memory
-  cudaDeviceProp prop;
-  cudaGetDeviceProperties(&prop, 0);
-  int maxThreadsPerBlock = prop.maxThreadsPerBlock;
-  int sharedMemSize = (maxThreadsPerBlock / 32) * sizeof(T);
-  
-  traceKernel<T><<<grid, block, sharedMemSize, stream>>>(d_result, d_input, rows, cols);
-  
-  // 同步流：确保 kernel 执行完成后再拷贝结果
-  RUNTIME_CHECK(cudaStreamSynchronize(stream));
-  
-  // 异步拷贝结果回主机
-  T h_result;
-  RUNTIME_CHECK(cudaMemcpyAsync(&h_result, d_result, sizeof(T), cudaMemcpyDeviceToHost, stream));
-  
-  // 同步流：确保结果拷贝完成
-  RUNTIME_CHECK(cudaStreamSynchronize(stream));
-  
-  // 异步释放内存
-  RUNTIME_CHECK(cudaFreeAsync(d_input, stream));
-  RUNTIME_CHECK(cudaFreeAsync(d_result, stream));
-  
-  // 同步流：确保释放完成后再销毁流
-  RUNTIME_CHECK(cudaStreamSynchronize(stream));
-  RUNTIME_CHECK(cudaStreamDestroy(stream));
-  
-  return h_result;
+    size_t n = std::min(rows, cols);
+    if (n == 0) return (T)0;
+
+    cudaStream_t stream;
+    RUNTIME_CHECK(cudaStreamCreate(&stream));
+    
+    T *d_input, *d_result;
+    size_t matrixSize = rows * cols * sizeof(T);
+
+    RUNTIME_CHECK(cudaMallocAsync(&d_input, matrixSize, stream));
+    RUNTIME_CHECK(cudaMallocAsync(&d_result, sizeof(T), stream));
+    RUNTIME_CHECK(cudaMemcpyAsync(d_input, h_input.data(), matrixSize, cudaMemcpyHostToDevice, stream));
+    RUNTIME_CHECK(cudaMemsetAsync(d_result, 0, sizeof(T), stream));
+    int blockSize = 1024;
+    if (n < blockSize) {
+        blockSize = ((n + 31) / 32) * 32;
+    }
+
+    int gridSize = (n + blockSize - 1) / blockSize;
+    
+    int numWarpsPerBlock = (blockSize + 31) / 32;
+    int sharedMemSize = numWarpsPerBlock * sizeof(T);
+    
+    traceKernel<T><<<gridSize, blockSize, sharedMemSize, stream>>>(
+        d_result, d_input, rows, cols, n
+    );
+    
+    T h_result = 0;
+    RUNTIME_CHECK(cudaMemcpyAsync(&h_result, d_result, sizeof(T), cudaMemcpyDeviceToHost, stream));
+    RUNTIME_CHECK(cudaStreamSynchronize(stream));
+    RUNTIME_CHECK(cudaFreeAsync(d_input, stream));
+    RUNTIME_CHECK(cudaFreeAsync(d_result, stream));
+    RUNTIME_CHECK(cudaStreamDestroy(stream));
+    
+    return h_result;
 }
 
 
@@ -156,7 +131,8 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
 
 //blockThread为(32,32)
 
-
+//采用falsh attention v2的思路实现
+//见遍历Q,再K,V
 template <typename T>
 __global__ void flashAttentionKernel(T* d_q, T* d_k, T* d_v, T* d_o, 
                                      int batch_size, int target_seq_len, int src_seq_len, 
@@ -186,6 +162,7 @@ __global__ void flashAttentionKernel(T* d_q, T* d_k, T* d_v, T* d_o,
   for(int i = 0; i < target_seq_len; i += BLOCK_SIZE){
     
     // Load Q
+    // 由于是一个block一个block处理Q的，要考虑越界
     bool is_valid_q_row = (i + threadIdx.y < target_seq_len);
     for(int k = 0; k < head_dim; k += BLOCK_SIZE){
       if (threadIdx.x + k < head_dim) {
@@ -195,6 +172,7 @@ __global__ void flashAttentionKernel(T* d_q, T* d_k, T* d_v, T* d_o,
       }
     }
 
+    //由第0号线程初始化m,l,o
     if(threadIdx.x == 0){
       smem_m[threadIdx.y] = -INFINITY;
       smem_l[threadIdx.y] = 0.0f;
@@ -216,7 +194,7 @@ __global__ void flashAttentionKernel(T* d_q, T* d_k, T* d_v, T* d_o,
     }
 
     for(int j = j_start; j < j_end; j += BLOCK_SIZE){
-      
+      //跳过被mask的部分，不参加计算
       if (is_causal) {
 
         int min_q_row = i;
@@ -226,7 +204,7 @@ __global__ void flashAttentionKernel(T* d_q, T* d_k, T* d_v, T* d_o,
           continue;
         }
       }
-      
+      // Load K,V, K,V都是(block_size, head_dim)
       bool is_valid_kv_row = (j + threadIdx.y < src_seq_len);
       for(int k = 0; k < head_dim && k + threadIdx.x < head_dim; k += BLOCK_SIZE){
         int cur_kv_idx = base_kv_offset + (j + threadIdx.y) * kv_heads * head_dim + k + threadIdx.x;
@@ -250,6 +228,7 @@ __global__ void flashAttentionKernel(T* d_q, T* d_k, T* d_v, T* d_o,
       int global_row = i + threadIdx.y;
       int global_col = j + threadIdx.x;
       
+      // 超出src_seq_len的部分mask掉，这里不能为0!!!!!!!!,要设置为-Infinity，不然exp(0)=1
       if (global_col >= src_seq_len) s_ij = -INFINITY;
       
       if (is_causal) {
@@ -257,14 +236,15 @@ __global__ void flashAttentionKernel(T* d_q, T* d_k, T* d_v, T* d_o,
         int min_kv_col = j;
         
         if (max_q_row >= min_kv_col) {
-          // This block may have some valid elements
-          if (global_row < global_col) {
-            s_ij = -INFINITY;
-          }
+          // if (global_row < global_col) {
+          //   s_ij = -INFINITY;
+          // }
+          s_ij = -INFINITY;
         }
         
       }
 
+      // 得到block_size行的max和sum，更新m,l
       float row_max = s_ij;
       for(int offset = BLOCK_SIZE / 2; offset > 0; offset >>= 1){
         row_max = fmaxf(row_max, __shfl_down_sync(0xffffffff, row_max, offset));
@@ -287,13 +267,14 @@ __global__ void flashAttentionKernel(T* d_q, T* d_k, T* d_v, T* d_o,
       float l_new = row_sum + rescale_factor * l_old;
 
       smem_s[threadIdx.y * BLOCK_SIZE + threadIdx.x] = s_ij; 
-      
+      //由第0号线程更新m,l
       if (threadIdx.x == 0) {
           smem_m[threadIdx.y] = m_new; 
           smem_l[threadIdx.y] = l_new; 
       }
       __syncthreads();
 
+      // Update O
       for(int k = 0; k < head_dim && k + threadIdx.x < head_dim; k += BLOCK_SIZE){
         float o_ij = smem_o[threadIdx.y * head_dim + k + threadIdx.x] * rescale_factor;
         
