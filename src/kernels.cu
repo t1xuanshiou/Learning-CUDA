@@ -85,33 +85,54 @@ __global__ void traceKernel(T* d_result, const T* d_input, size_t rows, size_t c
 
 template <typename T>
 T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
-  // TODO: Implement the trace function
-  //先把h_input拷贝到GPU
-  T* d_input;
-  T* d_result;
-  RUNTIME_CHECK(cudaMalloc(&d_input, rows * cols * sizeof(T)));
-  RUNTIME_CHECK(cudaMemcpy(d_input, h_input.data(), rows * cols * sizeof(T), cudaMemcpyHostToDevice));
-  RUNTIME_CHECK(cudaMalloc(&d_result, sizeof(T)));
-  RUNTIME_CHECK(cudaMemset(d_result, 0, sizeof(T)));
-  //设置stream
+  // 创建流（用于异步操作）
   cudaStream_t stream;
   RUNTIME_CHECK(cudaStreamCreate(&stream));
+  
+  // 异步内存分配
+  T* d_input;
+  T* d_result;
+  RUNTIME_CHECK(cudaMallocAsync(&d_input, rows * cols * sizeof(T), stream));
+  RUNTIME_CHECK(cudaMallocAsync(&d_result, sizeof(T), stream));
+  
+  // 异步内存拷贝和初始化
+  RUNTIME_CHECK(cudaMemcpyAsync(d_input, h_input.data(), rows * cols * sizeof(T), cudaMemcpyHostToDevice, stream));
+  RUNTIME_CHECK(cudaMemsetAsync(d_result, 0, sizeof(T), stream));
+  
+  // 同步流：确保数据拷贝完成后再启动 kernel
+  RUNTIME_CHECK(cudaStreamSynchronize(stream));
+  
+  // 配置并启动 kernel
   dim3 block(256);
-  dim3 grid( (std::min(rows,cols) + 256 - 1) / 256);
-  //分配shared memory： 最大的blocksize / 32
+  dim3 grid((std::min(rows, cols) + 256 - 1) / 256);
+  
+  // 分配 shared memory
   cudaDeviceProp prop;
-  cudaGetDeviceProperties(&prop, 0);  // 获取设备0的属性
+  cudaGetDeviceProperties(&prop, 0);
   int maxThreadsPerBlock = prop.maxThreadsPerBlock;
   int sharedMemSize = (maxThreadsPerBlock / 32) * sizeof(T);
+  
   traceKernel<T><<<grid, block, sharedMemSize, stream>>>(d_result, d_input, rows, cols);
+  
+  // 同步流：确保 kernel 执行完成后再拷贝结果
   RUNTIME_CHECK(cudaStreamSynchronize(stream));
+  
+  // 异步拷贝结果回主机
   T h_result;
-  RUNTIME_CHECK(cudaMemcpy(&h_result, d_result, sizeof(T), cudaMemcpyDeviceToHost));
-  RUNTIME_CHECK(cudaFree(d_input));
-  RUNTIME_CHECK(cudaFree(d_result));
+  RUNTIME_CHECK(cudaMemcpyAsync(&h_result, d_result, sizeof(T), cudaMemcpyDeviceToHost, stream));
+  
+  // 同步流：确保结果拷贝完成
+  RUNTIME_CHECK(cudaStreamSynchronize(stream));
+  
+  // 异步释放内存
+  RUNTIME_CHECK(cudaFreeAsync(d_input, stream));
+  RUNTIME_CHECK(cudaFreeAsync(d_result, stream));
+  
+  // 同步流：确保释放完成后再销毁流
+  RUNTIME_CHECK(cudaStreamSynchronize(stream));
   RUNTIME_CHECK(cudaStreamDestroy(stream));
+  
   return h_result;
-
 }
 
 
@@ -309,20 +330,31 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     int batch_size, int target_seq_len, int src_seq_len, 
                     int query_heads, int kv_heads, int head_dim, bool is_causal) {       
   
-  T* d_q; T* d_k; T* d_v; T* d_o;
+  // 创建流（用于异步操作）
+  cudaStream_t stream;
+  RUNTIME_CHECK(cudaStreamCreate(&stream));
+  
+  // 计算内存大小
   size_t q_size = batch_size * target_seq_len * query_heads * head_dim * sizeof(T);
   size_t kv_size = batch_size * src_seq_len * kv_heads * head_dim * sizeof(T);
   size_t o_size = batch_size * target_seq_len * query_heads * head_dim * sizeof(T);
 
-  RUNTIME_CHECK(cudaMalloc(&d_q, q_size));
-  RUNTIME_CHECK(cudaMalloc(&d_k, kv_size));
-  RUNTIME_CHECK(cudaMalloc(&d_v, kv_size));
-  RUNTIME_CHECK(cudaMalloc(&d_o, o_size));
+  // 异步内存分配
+  T* d_q; T* d_k; T* d_v; T* d_o;
+  RUNTIME_CHECK(cudaMallocAsync(&d_q, q_size, stream));
+  RUNTIME_CHECK(cudaMallocAsync(&d_k, kv_size, stream));
+  RUNTIME_CHECK(cudaMallocAsync(&d_v, kv_size, stream));
+  RUNTIME_CHECK(cudaMallocAsync(&d_o, o_size, stream));
 
-  RUNTIME_CHECK(cudaMemcpy(d_q, h_q.data(), q_size, cudaMemcpyHostToDevice));
-  RUNTIME_CHECK(cudaMemcpy(d_k, h_k.data(), kv_size, cudaMemcpyHostToDevice));
-  RUNTIME_CHECK(cudaMemcpy(d_v, h_v.data(), kv_size, cudaMemcpyHostToDevice));
+  // 异步内存拷贝（Host -> Device）
+  RUNTIME_CHECK(cudaMemcpyAsync(d_q, h_q.data(), q_size, cudaMemcpyHostToDevice, stream));
+  RUNTIME_CHECK(cudaMemcpyAsync(d_k, h_k.data(), kv_size, cudaMemcpyHostToDevice, stream));
+  RUNTIME_CHECK(cudaMemcpyAsync(d_v, h_v.data(), kv_size, cudaMemcpyHostToDevice, stream));
+  
+  // 同步流：确保输入数据拷贝完成后再启动 kernel
+  RUNTIME_CHECK(cudaStreamSynchronize(stream));
 
+  // 配置 kernel
   dim3 block(BLOCK_SIZE, BLOCK_SIZE);
   dim3 grid(batch_size, query_heads);
   
@@ -333,18 +365,26 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
   size_t smem_bytes_float = (BLOCK_SIZE * BLOCK_SIZE + 2 * BLOCK_SIZE + BLOCK_SIZE * head_dim) * sizeof(float);
   size_t smem_size = smem_bytes_t + smem_bytes_float;
   
-  cudaStream_t stream;
-  RUNTIME_CHECK(cudaStreamCreate(&stream));
-  
+  // 启动 kernel
   flashAttentionKernel<T><<<grid, block, smem_size, stream>>>(d_q, d_k, d_v, d_o, batch_size, target_seq_len, src_seq_len, query_heads, kv_heads, head_dim, is_causal, ratio, attention_scale);
   
+  // 同步流：确保 kernel 执行完成后再拷贝输出
   RUNTIME_CHECK(cudaStreamSynchronize(stream));
-  RUNTIME_CHECK(cudaMemcpy(h_o.data(), d_o, o_size, cudaMemcpyDeviceToHost));
+  
+  // 异步内存拷贝（Device -> Host）
+  RUNTIME_CHECK(cudaMemcpyAsync(h_o.data(), d_o, o_size, cudaMemcpyDeviceToHost, stream));
+  
+  // 同步流：确保输出数据拷贝完成
+  RUNTIME_CHECK(cudaStreamSynchronize(stream));
 
-  RUNTIME_CHECK(cudaFree(d_q));
-  RUNTIME_CHECK(cudaFree(d_k));
-  RUNTIME_CHECK(cudaFree(d_v));
-  RUNTIME_CHECK(cudaFree(d_o));  
+  // 异步释放内存
+  RUNTIME_CHECK(cudaFreeAsync(d_q, stream));
+  RUNTIME_CHECK(cudaFreeAsync(d_k, stream));
+  RUNTIME_CHECK(cudaFreeAsync(d_v, stream));
+  RUNTIME_CHECK(cudaFreeAsync(d_o, stream));
+  
+  // 同步流：确保释放完成后再销毁流
+  RUNTIME_CHECK(cudaStreamSynchronize(stream));
   RUNTIME_CHECK(cudaStreamDestroy(stream));
 }
 // *********************************************************************
